@@ -1,275 +1,237 @@
 import sqlite3
 import asyncio
+import aiohttp
+import os
+from pathlib import Path
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramNetworkError
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
-# Токен бота
-BOT_TOKEN = "7619827644:AAG7b9njo-8LqqzsqQX1n0t-Af4J5CROyAg"
+# Настройка логирования
+import logging
 
-# Инициализация бота с увеличенным таймаутом
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Конфигурация
+BOT_TOKEN = os.getenv("7619827644:AAGXHNp-GuSpOcJF5FMNZ7-D3tzvOcMyrsw")
+FASHION_API_KEY = os.getenv("FASHION_API_KEY", "mock_api_key")  # Для тестов
+ITEMS_PER_PAGE = 5
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Настройки сервера
+LOCAL_SERVER_HOST = "0.0.0.0"  # Подключения со всех интерфейсов
+LOCAL_SERVER_PORT = 8080
+WEBHOOK_PATH = "/webhook"
+BASE_WEBHOOK_URL = f"http://localhost:{LOCAL_SERVER_PORT}"  # Для локального тестирования
+
+# Инициализация бота
 bot = Bot(token=BOT_TOKEN, timeout=30)
 dp = Dispatcher()
 
-# Константы для пагинации
-ITEMS_PER_PAGE = 5
+# Настройка SQLAlchemy ORM
+Base = declarative_base()
 
 
-# Подключение к базам данных с Row factory
-def get_products_db():
-    conn = sqlite3.connect('products.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    price = Column(Float, nullable=False)
+    category = Column(String(50))
+    description = Column(Text)
+    image_path = Column(String(255))
+    size = Column(String(20))
+    color = Column(String(30))
 
 
-def get_clients_db():
-    conn = sqlite3.connect('clients.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+class Client(Base):
+    __tablename__ = "clients"
+    id = Column(Integer, primary_key=True)
+    full_name = Column(String(100), nullable=False)
+    phone = Column(String(20), nullable=False)
+    email = Column(String(100))
+    address = Column(Text)
 
 
-# Клавиатура главного меню
+# Подключение к БД
+engine = create_engine("sqlite:///./fashion_shop.db")
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# API для модных трендов
+async def get_fashion_trends():
+    """Получает тренды из MockAPI"""
+    api_url = "https://6824dee00f0188d7e72b3020.mockapi.io/fashion-trends"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                logger.error(f"Ошибка API: {response.status}")
+                return []
+    except Exception as e:
+        logger.error(f"Ошибка подключения к API: {e}")
+        return []
+
+
+# Клавиатуры
 def main_menu():
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🛍 Товары", callback_data="products"),
-        InlineKeyboardButton(text="👥 Клиенты", callback_data="clients")
+        InlineKeyboardButton(text="👗 Тренды", callback_data="trends")
     )
     builder.row(
-        InlineKeyboardButton(text="ℹ️ О боте", callback_data="about"),
-        InlineKeyboardButton(text="➕ Добавить товар", callback_data="add_product")
+        InlineKeyboardButton(text="👤 Клиенты", callback_data="clients"),
+        InlineKeyboardButton(text="ℹ️ О боте", callback_data="about")
     )
     return builder.as_markup()
 
 
-# ========== КОМАНДЫ ДЛЯ ТОВАРОВ ==========
-
-@dp.message(Command("products"))
-async def cmd_products(message: types.Message):
-    """Команда для вывода всех товаров"""
-    await show_products_page(message, page=0)
-
-
-@dp.message(Command("categories"))
-async def cmd_categories(message: types.Message):
-    """Команда для вывода категорий товаров"""
-    conn = get_products_db()
-    try:
-        categories = conn.execute(
-            "SELECT DISTINCT category FROM products"
-        ).fetchall()
-
-        if not categories:
-            await message.answer("📂 Категории не найдены")
-            return
-
-        builder = InlineKeyboardBuilder()
-        for category in categories:
-            builder.add(InlineKeyboardButton(
-                text=category['category'],
-                callback_data=f"category_{category['category']}"
-            ))
-        builder.adjust(2)
-
-        await message.answer(
-            "📂 Выберите категорию:",
-            reply_markup=builder.as_markup()
-        )
-    finally:
-        conn.close()
-
-
-# ========== ОБРАБОТЧИКИ ТОВАРОВ ==========
-
-async def show_products_page(message: types.Message, page: int):
-    """Показывает страницу с товарами"""
-    conn = get_products_db()
-    try:
-        offset = page * ITEMS_PER_PAGE
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT id, name, price FROM products LIMIT ? OFFSET ?",
-            (ITEMS_PER_PAGE, offset)
-        )
-        products = cursor.fetchall()
-
-        total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-
-        if not products:
-            await message.answer("🛒 Товары не найдены")
-            return
-
-        text = f"📦 Товары (страница {page + 1}/{(total // ITEMS_PER_PAGE) + 1}):\n\n"
-        for product in products:
-            text += f"{product['id']}. {product['name']} - {product['price']}₽\n"
-
-        builder = InlineKeyboardBuilder()
-
-        if page > 0:
-            builder.add(InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data=f"products_page_{page - 1}"
-            ))
-
-        if (page + 1) * ITEMS_PER_PAGE < total:
-            builder.add(InlineKeyboardButton(
-                text="Вперед ➡️",
-                callback_data=f"products_page_{page + 1}"
-            ))
-
-        await message.answer(text, reply_markup=builder.as_markup())
-
-    except Exception as e:
-        await message.answer(f"⚠️ Ошибка: {str(e)}")
-    finally:
-        conn.close()
-
-
-@dp.callback_query(F.data.startswith("products_page_"))
-async def change_products_page(callback: types.CallbackQuery):
-    """Обработчик переключения страниц товаров"""
-    page = int(callback.data.split("_")[-1])
-    await callback.message.delete()
-    await show_products_page(callback.message, page)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("category_"))
-async def show_category_products(callback: types.CallbackQuery):
-    """Показывает товары выбранной категории"""
-    category = callback.data.split("_", 1)[1]
-    conn = get_products_db()
-    try:
-        products = conn.execute(
-            "SELECT name, price FROM products WHERE category = ?",
-            (category,)
-        ).fetchall()
-
-        if not products:
-            await callback.message.edit_text(f"🛒 В категории '{category}' нет товаров")
-            return
-
-        text = f"📦 Товары в категории '{category}':\n\n"
-        text += "\n".join([f"{p['name']} - {p['price']}₽" for p in products])
-
-        await callback.message.edit_text(text, reply_markup=main_menu())
-    finally:
-        conn.close()
-    await callback.answer()
-
-
-# ========== СТАРЫЕ ОБРАБОТЧИКИ (оставьте без изменений) ==========
-
+# Обработчики команд
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Добро пожаловать в систему управления магазином!",
+        "👋 Добро пожаловать в магазин модной одежды!\n"
+        "Используйте меню для навигации:",
         reply_markup=main_menu()
     )
 
 
-@dp.callback_query(F.data == "products")
-async def show_products(callback: types.CallbackQuery):
-    try:
-        with get_products_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, price, category FROM products LIMIT 5")
-            products = cursor.fetchall()
+@dp.message(Command("trends"))
+async def cmd_trends(message: types.Message):
+    """Показывает текущие тренды из MockAPI"""
+    trends = await get_fashion_trends()
 
-            if not products:
-                await callback.answer("ℹ️ Нет доступных товаров", show_alert=True)
-                return
+    if not trends:
+        await message.answer("⚠️ Не удалось загрузить тренды. Попробуйте позже.")
+        return
 
-            response = "🛍 Товары:\n\n" + "\n".join(
-                f"{p['name']} - {p['price']}₽ ({p['category']})"
-                for p in products
-            )
-
-            count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-            response += f"\n\nВсего товаров: {count}"
-
-            await callback.message.edit_text(response, reply_markup=main_menu())
-
-    except sqlite3.Error as e:
-        await callback.answer(f"⛔ Ошибка БД: {e}", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"⚠️ Ошибка: {e}", show_alert=True)
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "clients")
-async def show_clients(callback: types.CallbackQuery):
-    conn = get_clients_db()
-    try:
-        clients = conn.execute("SELECT full_name, phone FROM clients LIMIT 5").fetchall()
-
-        if not clients:
-            await callback.message.edit_text("Клиентов нет в базе!", reply_markup=main_menu())
-            return
-
-        text = "👥 Последние клиенты:\n\n" + "\n".join(
-            f"{c['full_name']} - {c['phone']}" for c in clients
-        )
-        count = conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
-        text += f"\n\nВсего клиентов: {count}"
-
-        await callback.message.edit_text(text, reply_markup=main_menu())
-    except Exception as e:
-        await callback.message.edit_text(f"Ошибка: {str(e)}", reply_markup=main_menu())
-    finally:
-        conn.close()
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "about")
-async def show_about(callback: types.CallbackQuery):
-    text = (
-        "🤖 Бот для управления магазином\n\n"
-        "Функции:\n"
-        "- Просмотр товаров (/products)\n"
-        "- Фильтр по категориям (/categories)\n"
-        "- Управление клиентами\n"
-        "- Добавление товаров\n\n"
-        "Версия: 1.1"
+    response = "👗 Актуальные тренды:\n\n" + "\n".join(
+        f"• <b>{trend['name']}</b>\n{trend['description']}\n"
+        for trend in trends[:2]
     )
-    await callback.message.edit_text(text, reply_markup=main_menu())
-    await callback.answer()
+
+    await message.answer(response, parse_mode="HTML")
 
 
-@dp.callback_query(F.data == "add_product")
-async def add_product_start(callback: types.CallbackQuery):
-    await callback.message.answer("Введите название нового товара:")
-    await callback.answer()
+@dp.message(Command("products"))
+async def cmd_products(message: types.Message):
+    db = next(get_db())
+    products = db.query(Product).limit(ITEMS_PER_PAGE).all()
+    if products:
+        response = "📦 Товары:\n\n" + "\n".join(
+            f"{p.id}. {p.name} - {p.price}₽ ({p.size}, {p.color})" for p in products
+        )
+    else:
+        response = "🛒 Товаров пока нет"
+    await message.answer(response)
 
 
-# ========== ЗАПУСК БОТА ==========
+@dp.message(F.photo)
+async def handle_product_photo(message: types.Message):
+    db = next(get_db())
+    photo = message.photo[-1]
+    file_id = photo.file_id
+    file = await bot.get_file(file_id)
+    file_path = UPLOAD_DIR / f"{file_id}.jpg"
+
+    await bot.download_file(file.file_path, destination=file_path)
+
+    new_product = Product(
+        name="Новый товар",
+        price=0,
+        category="Одежда",
+        image_path=str(file_path),
+        size="M",
+        color="Черный"
+    )
+    db.add(new_product)
+    db.commit()
+    await message.answer(f"📸 Товар добавлен! ID: {new_product.id}")
+
+
+# Дополнительные API поинты
+async def health_check(request):
+    """Проверка работоспособности сервера"""
+    return web.Response(text="Сервер работает!")
+
+
+async def get_products_api(request):
+    """API для получения товаров"""
+    db = next(get_db())
+    products = db.query(Product).all()
+    products_data = [{
+        "id": p.id,
+        "name": p.name,
+        "price": p.price,
+        "category": p.category
+    } for p in products]
+    return web.json_response(products_data)
+
+
+async def on_startup(bot: Bot):
+    """Настройка вебхука при запуске"""
+    await bot.set_webhook(f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}")
+
+
+async def start_local_server():
+    """Запуск локального сервера"""
+    await on_startup(bot)
+
+    app = web.Application()
+    # Регистрация обработчиков
+    SimpleRequestHandler(dp, bot).register(app, path=WEBHOOK_PATH)
+    app.router.add_get("/", health_check)
+    app.router.add_get("/api/products", get_products_api)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=LOCAL_SERVER_HOST, port=LOCAL_SERVER_PORT)
+
+    logger.info(f"Сервер запущен на http://{LOCAL_SERVER_HOST}:{LOCAL_SERVER_PORT}")
+    logger.info(f"Вебхук: {BASE_WEBHOOK_URL}{WEBHOOK_PATH}")
+
+    await site.start()
+
+    # Бесконечное ожидание
+    await asyncio.Event().wait()
+
+
+async def start_polling():
+    """Запуск в режиме polling"""
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
 async def main():
+    """Основная функция запуска"""
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        print("Вебхук успешно удален")
-    except TelegramNetworkError as e:
-        print(f"Ошибка при удалении вебхука: {e}")
-        exit(1)
+        # Для локального тестирования с сервером
+        await start_local_server()
 
-    try:
-        with get_products_db() as conn:
-            conn.execute("SELECT 1 FROM products LIMIT 1")
-        print("✅ База товаров подключена")
 
-        with get_clients_db() as conn:
-            conn.execute("SELECT 1 FROM clients LIMIT 1")
-        print("✅ База клиентов подключена")
     except Exception as e:
-        print(f"❌ Ошибка подключения к БД: {e}")
-        exit(1)
-
-    print("🟢 Бот запускается...")
-    try:
-        await dp.start_polling(bot)
+        logger.error(f"Ошибка: {e}")
     finally:
         await bot.session.close()
 
@@ -278,6 +240,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Бот остановлен")
-    except Exception as e:
-        print(f"Критическая ошибка: {e}")
+        logger.info("Бот остановлен")
